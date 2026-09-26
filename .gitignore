@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Dataset (large file; place manually in data/)
+data/*.csv
+data/*.zip
+data/*.tar
+data/*.gz
+
+# Models & artifacts (generated)
+models/*
+!models/.gitkeep
+artifacts/*.json
+
+# Streaming output & checkpoints (generated)
+output/*
+!output/.gitkeep
+checkpoints/*
+
+# Spark
+spark-warehouse/
+derby.log
+metastore_db/
+
+# Windows / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log

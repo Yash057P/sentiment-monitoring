@@ -1,0 +1,13 @@
+# Core streaming / ML stack
+# Spark 4.x is used because it officially supports modern JDK 17 (Spark 3.5 does not
+# run on JDK 17+; a portable JRE 17 lives inside .venv/jvm17 - see README).
+pyspark>=4.0.0,<4.1
+confluent-kafka>=2.3.0
+
+# Dashboard
+streamlit>=1.40.0
+pandas>=2.0.0
+pyarrow>=14.0.0
+
+# Testing
+pytest>=7.4.0
