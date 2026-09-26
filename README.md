@@ -41,12 +41,15 @@ and scalable machine learning (Spark MLlib).
 
 ## Objectives
 
-1. Ingest synthetic streaming data using Apache Kafka.
+1. Ingest streaming data using Apache Kafka.
 2. Process the stream with Spark Structured Streaming.
 3. Classify sentiment in-flight using a Spark MLlib model trained on the
-   Sentiment140 dataset.
+   Sentiment140 dataset, with the data split into 4 parts: **train** (60%),
+   **test** (15%), **validation** (15%) and a hold-out **simulation** part (10%)
+   used exclusively for the live demo.
 4. Aggregate sentiment into 1-minute windows to reveal live trends.
 5. Visualize KPIs, charts and the latest tweets on a Streamlit dashboard.
+6. One command (`scripts/run_demo.py`) runs the entire project end to end.
 
 ## Technologies Used
 
@@ -87,6 +90,21 @@ Labels (binary sentiment classification):
 
 The project **only** does binary classification (Negative / Positive). There is
 no artificial Neutral class. Original tweet text is preserved for display.
+
+### 4-part split
+
+The dataset is deterministically divided (hash of the tweet id, so re-running
+always produces identical parts) into:
+
+| Part | File | Share | Purpose |
+|---|---|---|---|
+| Part 1 | `data/split/train.csv` | 60% (~960k) | Model training |
+| Part 2 | `data/split/test.csv` | 15% (~240k) | Testing (accuracy, precision, recall…) |
+| Part 3 | `data/split/validation.csv` | 15% (~240k) | Validation (extra metric check) |
+| Part 4 | `data/split/simulation.csv` | 10% (~160k) | **Live simulation feed** — the demo streams *only* this hold-out part, so the model never saw these tweets during training |
+
+`scripts/run_demo.py` downloads the dataset (if missing), performs this split,
+trains the model on Part 1 and evaluates it on Parts 2 & 3 automatically.
 
 See `data/README.md` for exact download instructions.
 
@@ -156,7 +174,7 @@ RegexTokenizer  ->  StopWordsRemover  ->  HashingTF  ->  IDF  ->  LogisticRegres
 ### Why Logistic Regression?
 
 - Well suited to **large, sparse** TF-IDF text features.
-- **Scales elegantly** in Spark MLlib across the ~1.28M-row training set.
+- **Scales elegantly** in Spark MLlib across the ~960k-row training part.
 - Fully **interpretable** (weights per feature, standard classification
   metrics).
 - Appropriate for **binary** positive/negative sentiment, with a natural
@@ -180,12 +198,14 @@ SML_BDA/
 |-- jars/                     # Kafka connector jars for Spark Structured Streaming
 |-- scripts/
 |   |-- bootstrap.ps1         # one-command Windows setup (venv, JRE17, winutils, jars)
+|   |-- run_demo.py           # ONE command: env -> dataset -> split -> train -> live demo
 |-- src/
 |   |-- config.py             # all configuration + env overrides
 |   |-- spark_utils.py        # shared SparkSession builder
 |   |-- dataset_utils.py      # Sentiment140 loader, cleaning, label conversion
-|   |-- train_model.py        # trains + saves the Spark ML PipelineModel
-|   |-- kafka_producer.py     # replays Sentiment140 into Kafka as JSON
+|   |-- dataset_split.py      # 4-way split: train/test/validation/simulation
+|   |-- train_model.py        # trains + evaluates (Parts 1/2/3) + saves the model
+|   |-- kafka_producer.py     # replays the simulation part into Kafka as JSON
 |   |-- streaming_sentiment.py# Kafka -> ML predictions -> Parquet + trends
 |-- dashboard/
 |   |-- app.py                # Streamlit dashboard
@@ -195,6 +215,31 @@ SML_BDA/
 |-- .gitignore
 |-- README.md
 ```
+
+---
+
+## Quick Start (recommended)
+
+> **One command runs the ENTIRE project.** Nothing else is required.
+
+```powershell
+python scripts\run_demo.py
+```
+
+`run_demo.py` does everything automatically:
+
+1. Creates the virtual environment + installs required libraries (if missing,
+   it runs `scripts/bootstrap.ps1` first).
+2. Downloads the **Sentiment140** dataset from Stanford (if missing; a built-in
+   demo set is used when offline).
+3. Splits it into the **4 parts** (train / test / validation / simulation).
+4. Trains the model on **Part 1**, evaluates **Part 2 (test)** and
+   **Part 3 (validation)**.
+5. Starts Docker Kafka → Spark streaming → the producer streaming **Part 4
+   (simulation)** "as if live" → opens the Streamlit dashboard in the browser.
+
+Press `Ctrl+C` to stop everything (it also cleans up Docker). See
+[Running the Project](#running-the-project) for the manual steps and options.
 
 ---
 
@@ -239,21 +284,22 @@ pip install -r requirements.txt
 
 ## Dataset Setup
 
-1. Download **Sentiment140** from
-   https://www.kaggle.com/datasets/kazanova/sentiment140 (free Kaggle account).
-2. Unzip `archive.zip`.
-3. Copy `training.1600000.processed.noemoticon.csv` into:
-
-   ```
-   data/training.1600000.processed.noemoticon.csv
-   ```
-
-4. Optional quick test: any smaller CSV with the same schema works too,
-   e.g. `python src/train_model.py --limit 50000`.
+1. **Automatic (recommended):** `python scripts\run_demo.py` downloads
+   Sentiment140 for you (Stanford mirror, ~80 MB) and places it here:
+   `data/training.1600000.processed.noemoticon.csv`
+2. **Manual:** download from
+   https://www.kaggle.com/datasets/kazanova/sentiment140 (free Kaggle account),
+   unzip and copy the file into `data/`. If the network is unavailable,
+   `run_demo.py` falls back to a small built-in demo dataset so the demo still
+   runs offline.
 
 ---
 
 ## Running the Project
+
+> **Recommended:** run the whole project with the single command
+> `python scripts\run_demo.py` (see [Quick Start](#quick-start-recommended)).
+> The steps below show how each part works individually.
 
 Run every command from the project root. Use the venv's Python.
 
@@ -274,23 +320,34 @@ docker compose down -v     # stop and delete Kafka data
 
 ### STEP 2 — Train the ML model (once)
 
-Train on the full dataset (a few minutes on a laptop):
+Trains on **Part 1** (`data/split/train.csv`) and evaluates **Part 2 (test)**
+and **Part 3 (validation)**:
 
 ```bash
-.\.venv\Scripts\python.exe src\train_model.py
+.\.venv\Scripts\python.exe src\train_model.py`
+    --train-dataset data\split\train.csv
+    --test-dataset  data\split\test.csv
+    --valid-dataset data\split\validation.csv
 ```
 
-Quick smoke training on the first 50k rows instead:
+Quick smoke training on the first 50k rows of Part 1 instead:
 
 ```bash
-.\.venv\Scripts\python.exe src\train_model.py --limit 50000
+.\.venv\Scripts\python.exe src\train_model.py`
+    --train-dataset data\split\train.csv
+    --test-dataset  data\split\test.csv
+    --valid-dataset data\split\validation.csv
+    --limit 50000
 ```
+
+> If the parts don't exist yet, first run `python src\dataset_split.py`, or
+> simply use `scripts\run_demo.py` which does all of this automatically.
 
 Outputs:
 
 - `models/sentiment_pipeline/` — the complete fitted `PipelineModel`
 - `artifacts/model_metrics.json` — accuracy/precision/recall/F1/AUC + confusion
-  matrix, computed from real test-set predictions
+  matrix, computed from real predictions on the test AND validation parts
 
 The streaming app **does not retrain**; it loads the saved model.
 
@@ -308,15 +365,17 @@ it can be started before the producer — only Kafka itself must already be up.
 
 ### STEP 4 — Start the Kafka producer (separate terminal)
 
+Streams **Part 4 (simulation)** — the demo's live feed:
+
 ```bash
-.\.venv\Scripts\python.exe src\kafka_producer.py --messages-per-second 10
+.\.venv\Scripts\python.exe src\kafka_producer.py --dataset data\split\simulation.csv --messages-per-second 10
 ```
 
 Options:
 
 ```bash
 # Stop after 1000 messages, faster rate
-.\.venv\Scripts\python.exe src\kafka_producer.py --messages-per-second 50 --max-messages 1000
+.\.venv\Scripts\python.exe src\kafka_producer.py --dataset data\split\simulation.csv --messages-per-second 50 --max-messages 1000
 ```
 
 ### STEP 5 — Open the Streamlit dashboard (separate terminal)
@@ -330,11 +389,16 @@ start filling once messages flow.
 
 ### Typical flow
 
+```bash
+EVERYTHING:   python scripts\run_demo.py          # the whole project in one command
 ```
+```bash
+# ...or manually, step by step:
 Kafka          docker compose up -d
-Model          python src/train_model.py
+Split          python src/dataset_split.py        # data/split/*.csv (4 parts)
+Model          python src/train_model.py --train-dataset data\split\train.csv --test-dataset data\split\test.csv --valid-dataset data\split\validation.csv
 Streaming      python src/streaming_sentiment.py   (terminal 1)
-Producer       python src/kafka_producer.py          (terminal 2)
+Producer       python src/kafka_producer.py --dataset data\split\simulation.csv   (terminal 2)
 Dashboard      streamlit run dashboard/app.py        (terminal 3)
 ```
 
@@ -342,14 +406,16 @@ Dashboard      streamlit run dashboard/app.py        (terminal 3)
 
 ## Model Evaluation
 
-`train_model.py` evaluates the held-out test set (20%) using real predictions:
+`train_model.py` trains on **Part 1** and evaluates on **Part 2 (test)** and
+**Part 3 (validation)** using real predictions:
 
 - **Accuracy**, **Precision**, **Recall**, **F1-score**, **Area under ROC**
 - **Confusion matrix** derived from `groupBy(label, prediction)` counts
-- Metrics are written to `artifacts/model_metrics.json` and optionally shown on
-  the dashboard.
+- Both test and validation metrics are written to
+  `artifacts/model_metrics.json` and shown on the dashboard.
 
-No results are fabricated; all values come from actual model outputs.
+No results are fabricated; all values come from actual model outputs, measured
+on data the model never trained on.
 
 ## Streaming Analysis
 
@@ -375,7 +441,8 @@ No results are fabricated; all values come from actual model outputs.
 
 - Sentiment140 is a **historical** dataset; tweets are **replayed through
   Kafka** to simulate a continuous social-media stream. The project does not
-  depend on a live social-media API.
+  depend on a live social-media API. The demo streams only the hold-out
+  **simulation part** so the "live" tweets were never used for training.
 - The ML model is trained on 2009-era tweets, so performance on modern language
   is approximate (classic ML task, no transformer models).
 - The dashboard and streaming app run on a single machine (`local[*]`), the

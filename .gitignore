@@ -6,11 +6,17 @@ __pycache__/
 venv/
 *.egg-info/
 
-# Dataset (large file; place manually in data/)
+# Dataset (large files; run_demo.py downloads + splits them automatically)
 data/*.csv
 data/*.zip
 data/*.tar
 data/*.gz
+data/split/
+
+# Personal viva script (local only - never pushed)
+VIVA_SCRIPT.md
+VIVA_SCRIPT.docx
+~$*.docx
 
 # Models & artifacts (generated)
 models/*
@@ -21,6 +27,7 @@ artifacts/*.json
 output/*
 !output/.gitkeep
 checkpoints/*
+logs/
 
 # Spark
 spark-warehouse/

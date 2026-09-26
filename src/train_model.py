@@ -10,6 +10,10 @@ both the fitted model (models/sentiment_pipeline) and the metrics
 Usage:
     python src/train_model.py                 # train on the full dataset
     python src/train_model.py --limit 50000   # quick smoke training
+    python src/train_model.py \\               # train on PART 1, evaluate PART 2 & 3
+        --train-dataset data/split/train.csv \\
+        --test-dataset  data/split/test.csv \\
+        --valid-dataset data/split/validation.csv
 """
 
 from __future__ import annotations
@@ -64,9 +68,9 @@ def build_pipeline() -> Pipeline:
     return Pipeline(stages=[tokenizer, remover, hashing, idf, lr])
 
 
-def evaluate_model(model, test_df: "DataFrame") -> dict:
+def evaluate_model(model, eval_df, label: str = "test split") -> dict:
     """Compute accuracy / precision / recall / F1 / AUC / confusion matrix."""
-    predictions = model.transform(test_df)
+    predictions = model.transform(eval_df)
 
     counts = (
         predictions.select(
@@ -77,7 +81,7 @@ def evaluate_model(model, test_df: "DataFrame") -> dict:
     )
     total = predictions.count()
     if total == 0:
-        raise ValueError("Test set is empty - cannot evaluate.")
+        raise ValueError(f"{label.capitalize()} set is empty - cannot evaluate.")
 
     # Confusion matrix elements from (label, prediction) counts.
     cm = (
@@ -112,7 +116,7 @@ def evaluate_model(model, test_df: "DataFrame") -> dict:
         "recall": round(float(recall), 4),
         "f1_score": round(float(f1), 4),
         "area_under_roc": round(float(auc), 4),
-        "test_rows": int(total),
+        "rows": int(total),
         "confusion_matrix": {
             "true_negative": int(tn),
             "false_positive": int(fp),
@@ -121,7 +125,7 @@ def evaluate_model(model, test_df: "DataFrame") -> dict:
         },
     }
 
-    logger.info("--- Test set evaluation (%s rows) ---", f"{total:,}")
+    logger.info("--- %s evaluation (%s rows) ---", label, f"{total:,}")
     logger.info("Confusion matrix (rows=actual, cols=predicted):")
     logger.info("            pred=0   pred=1")
     logger.info("actual=0    %7d  %7d", tn, fp)
@@ -144,20 +148,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         default=str(config.DATASET_PATH),
-        help="Path to Sentiment140 CSV",
+        help="Fallback dataset path (used when --train-dataset is absent)",
+    )
+    parser.add_argument(
+        "--train-dataset",
+        default=None,
+        help="Part 1: CSV used for TRAINING (data/split/train.csv)",
+    )
+    parser.add_argument(
+        "--test-dataset",
+        default=None,
+        help="Part 2: CSV used for TESTING/evaluation (data/split/test.csv)",
+    )
+    parser.add_argument(
+        "--valid-dataset",
+        default=None,
+        help="Part 3: CSV used for VALIDATION checks (data/split/validation.csv)",
     )
     parser.add_argument("--model-dir", default=str(config.MODEL_DIR))
     parser.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="Optional: train only on the first N rows (quick smoke training)",
+        help="Optional: train only on the first N train rows (quick smoke training)",
     )
     parser.add_argument(
         "--test-fraction",
         type=float,
         default=config.EVALUATION_TEST_FRACTION,
-        help="Fraction of data held out for evaluation (default 0.2)",
+        help="Fraction held out when NOT using a pre-split --test-dataset",
     )
     parser.add_argument("--seed", type=int, default=config.RANDOM_SEED)
     return parser.parse_args()
@@ -170,24 +189,61 @@ def main() -> None:
     try:
         start = time.time()
 
-        data = dataset_utils.load_sentiment140(spark, args.dataset, limit=args.limit)
-        dataset_utils.dataset_statistics(data)
-
-        # Text cleaning is part of the preprocessing (before the pipeline).
-        data = dataset_utils.clean_tweets(data, "text", "clean_text")
-
-        logger.info("Splitting with seed=%s (test fraction=%.2f)...",
-                    args.seed, args.test_fraction)
-        train_df, test_df = data.randomSplit(
-            [1.0 - args.test_fraction, args.test_fraction], seed=args.seed
+        train_path = args.train_dataset or args.dataset
+        logger.info("Training data: %s%s",
+                    train_path, f" (limit={args.limit})" if args.limit else "")
+        train_df = dataset_utils.load_sentiment140(
+            spark, train_path, limit=args.limit
         )
+        dataset_utils.dataset_statistics(train_df)
+        train_df = dataset_utils.clean_tweets(train_df, "text", "clean_text")
 
-        logger.info("Training model...")
+        logger.info("Training model on %s rows...", f"{train_df.count():,}")
         pipeline = build_pipeline()
         model = pipeline.fit(train_df)
         logger.info("Training finished in %.1fs", time.time() - start)
 
-        metrics = evaluate_model(model, test_df)
+        if args.test_dataset:
+            logger.info("Evaluating on PART 2 (test): %s", args.test_dataset)
+            test_df = dataset_utils.load_sentiment140(spark, args.test_dataset)
+            test_df = dataset_utils.clean_tweets(test_df, "text", "clean_text")
+            test_metrics = evaluate_model(model, test_df, label="test split")
+        else:
+            logger.info("Splitting training data (seed=%s, test fraction=%.2f)...",
+                        args.seed, args.test_fraction)
+            train_sub, test_sub = train_df.randomSplit(
+                [1.0 - args.test_fraction, args.test_fraction], seed=args.seed
+            )
+            model = pipeline.fit(train_sub)
+            train_df = train_sub
+            test_metrics = evaluate_model(model, test_sub, label="test split")
+
+        metrics: dict = {}
+        metrics["training_set"] = {
+            "path": str(train_path),
+            "rows": int(train_df.count()),
+        }
+        metrics["test"] = test_metrics
+
+        if args.valid_dataset:
+            logger.info("Evaluating on PART 3 (validation): %s", args.valid_dataset)
+            valid_df = dataset_utils.load_sentiment140(spark, args.valid_dataset)
+            valid_df = dataset_utils.clean_tweets(valid_df, "text", "clean_text")
+            metrics["validation"] = evaluate_model(
+                model, valid_df, label="validation split"
+            )
+            valid_metrics = metrics["validation"]
+            logger.info(
+                "Validation vs test accuracy: %.4f vs %.4f",
+                valid_metrics["accuracy"], test_metrics["accuracy"],
+            )
+
+        # Top-level keys kept for dashboard compatibility (they reflect PART 2).
+        for key in (
+            "accuracy", "precision", "recall", "f1_score",
+            "area_under_roc", "rows", "confusion_matrix",
+        ):
+            metrics[key] = test_metrics[key]
         metrics["trained_rows"] = int(train_df.count())
         metrics["model_dir"] = str(config.MODEL_DIR)
         save_metrics(metrics)

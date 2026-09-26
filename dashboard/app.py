@@ -26,7 +26,7 @@ REFRESH_SECONDS = 5
 MAX_LATEST_TWEETS = 10
 
 # Cap in-memory rows so a long-running demo never grows unbounded.
-MAX_CACHED_ROWS = 5_000
+MAX_CACHED_ROWS = 50_000
 
 
 def _refresh_parquet_cache(state: dict, path: Path) -> pd.DataFrame:
@@ -90,11 +90,14 @@ def render_dashboard() -> None:
     trends = read_parquet_dir(config.TRENDS_DIR, key="trends")
     predictions = read_parquet_dir(config.PREDICTIONS_DIR, key="predictions")
 
-    # ---------------- KPI cards (windowed trend totals written by Spark) ----
-    if not trends.empty:
-        total = int(trends["total_messages"].sum())
-        positive = int(trends["positive_messages"].sum())
-        negative = int(trends["negative_messages"].sum())
+    # ---------------- KPI cards (live counts from processed tweets) --------
+    # Headline numbers come from the live predictions stream so they tick on
+    # every refresh (a few seconds) instead of waiting for a closed window.
+    if not predictions.empty and "predicted_sentiment" in predictions.columns:
+        labels = predictions["predicted_sentiment"].fillna("")
+        total = int((labels != "").sum())
+        positive = int((labels == "Positive").sum())
+        negative = int((labels == "Negative").sum())
         pos_pct = (100.0 * positive / total) if total else 0.0
         neg_pct = 100.0 - pos_pct if total else 0.0
     else:
@@ -116,7 +119,7 @@ def render_dashboard() -> None:
         ).set_index("Sentiment")
         st.bar_chart(dist)
     else:
-        st.info("No windowed trend data yet. Waiting for Spark streaming output...")
+        st.info("No tweets processed yet. Waiting for Spark streaming output...")
 
     # ---------------- Sentiment trend over time ----------------
     st.subheader("Sentiment Trend Over Time")
@@ -128,7 +131,8 @@ def render_dashboard() -> None:
         ]
         st.line_chart(chart)
     else:
-        st.info("No trend data yet.")
+        st.info("No trend data yet. The line appears after the first 1-minute "
+                "window closes (~2 min).")
 
     # ---------------- Latest processed tweets ----------------
     st.subheader("Latest Processed Tweets")
@@ -203,8 +207,8 @@ def main() -> None:
 
     st.divider()
     st.caption(
-        "Trend/KPI totals are recomputed by Spark every minute (1-minute windows, "
-        "watermark-based) - they are not hardcoded."
+        "KPI totals update live from processed tweets every refresh; the trend "
+        "line is Spark's 1-minute windowed aggregation (watermark-based)."
     )
 
 
