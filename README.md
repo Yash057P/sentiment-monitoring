@@ -186,6 +186,9 @@ RegexTokenizer  ->  StopWordsRemover  ->  HashingTF  ->  IDF  ->  LogisticRegres
 
 No Hugging Face / BERT / Transformers / external sentiment APIs are used.
 
+> Full reasoning, the rejected alternatives and measured metrics are documented
+> in [`documents/model_selection.md`](documents/model_selection.md).
+
 ---
 
 ## Project Structure
