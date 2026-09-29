@@ -29,6 +29,10 @@ output/*
 checkpoints/*
 logs/
 
+# Frontend (node modules + build output are generated)
+frontend/node_modules/
+frontend/dist/
+
 # Spark
 spark-warehouse/
 derby.log

@@ -44,6 +44,10 @@ MESSAGE_SCHEMA = StructType(
         StructField("actual_sentiment", LongType(), True),
         StructField("ingestion_timestamp", StringType(), True),
         StructField("ingestion_ts_ms", LongType(), True),
+        StructField("company", StringType(), True),
+        StructField("company_name", StringType(), True),
+        StructField("sector", StringType(), True),
+        StructField("source", StringType(), True),
     ]
 )
 
@@ -108,6 +112,10 @@ def add_predictions(clean: DataFrame, model: PipelineModel) -> DataFrame:
         .alias("predicted_sentiment"),
         F.col("ingestion_timestamp"),
         F.col("ingestion_ts_ms"),
+        F.col("company"),
+        F.col("company_name"),
+        F.col("sector"),
+        F.col("source"),
         F.current_timestamp().alias("processing_time"),
     )
     return result

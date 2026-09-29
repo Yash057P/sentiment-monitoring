@@ -2,8 +2,9 @@
 
 A real-time analytics MVP that consumes a stream of tweets via **Apache Kafka**,
 classifies each tweet's sentiment with a scalable **Spark MLlib** model inside
-**Spark Structured Streaming**, computes windowed sentiment trends, and shows
-everything on a lightweight **Streamlit** dashboard.
+**Spark Structured Streaming**, computes windowed sentiment trends, and serves
+everything through a **Flask REST API** to a **React** web app with role-based
+admin/company dashboards, light/dark mode and English/Hindi/Marathi.
 
 ```
                      Sentiment140 Dataset
@@ -27,7 +28,7 @@ everything on a lightweight **Streamlit** dashboard.
                   |                          |
                   +------------+-------------+
                                v
-                     Streamlit Dashboard
+             Parquet -> Flask API -> React
 ```
 
 ---
@@ -48,7 +49,9 @@ and scalable machine learning (Spark MLlib).
    **test** (15%), **validation** (15%) and a hold-out **simulation** part (10%)
    used exclusively for the live demo.
 4. Aggregate sentiment into 1-minute windows to reveal live trends.
-5. Visualize KPIs, charts and the latest tweets on a Streamlit dashboard.
+5. Visualize KPIs, charts and the latest tweets on a role-based React web app
+   served by the Flask API (admin sees every company; each company user only
+   sees its own).
 6. One command (`scripts/run_demo.py`) runs the entire project end to end.
 
 ## Technologies Used
@@ -59,7 +62,8 @@ and scalable machine learning (Spark MLlib).
 | Stream engine | Apache Spark 4.0 + Spark Structured Streaming |
 | ML            | Spark MLlib (TF-IDF + Logistic Regression)    |
 | Language      | Python 3.10 / PySpark                         |
-| Dashboard     | Streamlit                                     |
+| Web API       | Flask 3 (REST, JWT auth, CORS)               |
+| Web UI        | React 18 + Vite + Recharts                    |
 | Infra         | Docker / Docker Compose                       |
 
 > Spark **4.0.x** is intentionally chosen: older Spark 3.5.x throws
@@ -140,7 +144,7 @@ output/predictions (Parquet)     output/trends (Parquet, 1-minute windows,
     |                                  |
     +------------------+---------------+
                        v
-              Streamlit Dashboard (dashboard/app.py)
+              Flask REST API (backend/app.py)  ->  React web app
 ```
 
 Two Spark streaming queries run off the same Kafka source:
@@ -149,8 +153,8 @@ Two Spark streaming queries run off the same Kafka source:
   (with a 2-minute watermark) writing totals + Positive/Negative percentages to
   `output/trends`.
 
-The trend/count numbers shown on the dashboard are computed *by Spark*, not in
-Python or Pandas.
+The trend/count numbers shown on screen are computed *by Spark*, not in
+Python or Pandas; the Flask API only reads the Parquet that Spark wrote.
 
 ---
 
@@ -207,14 +211,68 @@ SML_BDA/
 |   |-- train_model.py        # trains + evaluates (Parts 1/2/3) + saves the model
 |   |-- kafka_producer.py     # replays the simulation part into Kafka as JSON
 |   |-- streaming_sentiment.py# Kafka -> ML predictions -> Parquet + trends
-|-- dashboard/
-|   |-- app.py                # Streamlit dashboard
-|-- tests/                    # basic unit tests
+|-- backend/
+|   |-- app.py                # Flask REST API + serves the built React app
+|   |-- analytics.py          # incremental Parquet reader + live KPI aggregation
+|   |-- auth.py               # JWT login + admin/company roles
+|-- frontend/                 # React 18 + Vite web app (npm run build -> dist/)
+|-- tests/                    # backend/API + dataset unit tests
 |-- docker-compose.yml        # single-node Kafka (KRaft)
 |-- requirements.txt
 |-- .gitignore
 |-- README.md
 ```
+
+---
+
+## Web Application (Flask API + React UI)
+
+The UI replaced the earlier Streamlit prototype. Spark still writes Parquet; the
+Flask API reads it incrementally (only *new* files per scan) and the React app
+polls the API every 5 seconds.
+
+### Roles & login
+
+| Role     | Username                              | Password       |
+|----------|---------------------------------------|----------------|
+| Admin    | `admin`                               | `admin`        |
+| Company  | `technova`, `urbaneats`, `skyride`, `novapay`, `pacificair`, `zenwear` | `<handle>123` |
+
+Login returns a 12-hour JWT. The admin sees every company, tweet stream and
+outlook; a company user only ever receives its own data (enforced server-side
+by `require_role`, not just hidden in the UI).
+
+### API
+
+| Method | Endpoint                        | Access | Purpose                                  |
+|--------|---------------------------------|--------|------------------------------------------|
+| POST   | `/api/auth/login`               | public | returns `{ token, profile }`             |
+| GET    | `/api/me`                       | any    | current profile                          |
+| GET    | `/api/health`                   | public | liveness + live row count                |
+| GET    | `/api/companies/meta`           | any    | company list, sectors, keywords          |
+| GET    | `/api/admin/overview`           | admin  | platform KPIs, per-company table, chart  |
+| GET    | `/api/admin/tweets?company=`    | admin  | latest tweets + negative "impact" keywords |
+| POST   | `/api/admin/reset`              | admin  | clear live data, counters restart from 0 |
+| GET    | `/api/company/overview`         | company| that company's KPIs, chart, outlook, forecast |
+| GET    | `/api/company/tweets?filter=`   | company| positive / negative / all tweets        |
+| GET    | `/api/overall`                  | public | landing-page summary                    |
+
+**Reset live data** (`POST /api/admin/reset`, body `{"wipe_files": true}`)
+clears the API's in-memory cache and deletes the existing
+`output/predictions` Parquet files, so every counter restarts at 0 and counts
+only tweets streamed from that moment on. Spark checkpoints and the Kafka topic
+are intentionally kept, so already-consumed messages are not replayed.
+
+### Frontend features
+
+- Interactive login with quick demo-account chips and password visibility toggle.
+- Admin dashboard: platform KPIs, per-company comparison, tweet search, live feed.
+- Company dashboard: KPIs, sentiment timeline chart, 1-minute outlook
+  (Good / Warning / Bad), short forecast and the keywords behind negative tweets.
+- Persistent light/dark theme, English / Hindi / Marathi switcher, About Us and
+  Settings pages, desktop taskbar nav and a mobile drawer.
+- `scripts/run_demo.py` supervises the streaming, producer and web processes and
+  restarts any of them that dies.
 
 ---
 
@@ -236,9 +294,12 @@ python scripts\run_demo.py
 4. Trains the model on **Part 1**, evaluates **Part 2 (test)** and
    **Part 3 (validation)**.
 5. Starts Docker Kafka → Spark streaming → the producer streaming **Part 4
-   (simulation)** "as if live" → opens the Streamlit dashboard in the browser.
+   (simulation)** "as if live" → builds the React app and opens the Flask web
+   app in the browser.
 
-Press `Ctrl+C` to stop everything (it also cleans up Docker). See
+While it runs, the supervisor watches the streaming, producer and web processes
+and restarts any of them that dies. Press `Ctrl+C` to stop everything (it also
+cleans up Docker). See
 [Running the Project](#running-the-project) for the manual steps and options.
 
 ---
@@ -378,14 +439,21 @@ Options:
 .\.venv\Scripts\python.exe src\kafka_producer.py --dataset data\split\simulation.csv --messages-per-second 50 --max-messages 1000
 ```
 
-### STEP 5 — Open the Streamlit dashboard (separate terminal)
+### STEP 5 — Start the Flask API + React web app (separate terminal)
 
 ```bash
-.\.venv\Scripts\streamlit.exe run dashboard\app.py
+.\.venv\Scripts\python.exe backend\app.py
 ```
 
-Open http://localhost:8501 — it auto-refreshes every 5 seconds and will
-start filling once messages flow.
+Open http://localhost:8000 — Flask serves the built React bundle and the JSON
+API, the app auto-refreshes every 5 seconds and will start filling once
+messages flow. The first run needs the frontend to be built once:
+
+```bash
+cd frontend
+npm install
+npm run build
+```
 
 ### Typical flow
 
@@ -399,7 +467,7 @@ Split          python src/dataset_split.py        # data/split/*.csv (4 parts)
 Model          python src/train_model.py --train-dataset data\split\train.csv --test-dataset data\split\test.csv --valid-dataset data\split\validation.csv
 Streaming      python src/streaming_sentiment.py   (terminal 1)
 Producer       python src/kafka_producer.py --dataset data\split\simulation.csv   (terminal 2)
-Dashboard      streamlit run dashboard/app.py        (terminal 3)
+Web app        python backend/app.py                     (terminal 3)
 ```
 
 ---
@@ -412,7 +480,7 @@ Dashboard      streamlit run dashboard/app.py        (terminal 3)
 - **Accuracy**, **Precision**, **Recall**, **F1-score**, **Area under ROC**
 - **Confusion matrix** derived from `groupBy(label, prediction)` counts
 - Both test and validation metrics are written to
-  `artifacts/model_metrics.json` and shown on the dashboard.
+  `artifacts/model_metrics.json` and surfaced in the admin dashboard.
 
 No results are fabricated; all values come from actual model outputs, measured
 on data the model never trained on.
@@ -445,10 +513,12 @@ on data the model never trained on.
   **simulation part** so the "live" tweets were never used for training.
 - The ML model is trained on 2009-era tweets, so performance on modern language
   is approximate (classic ML task, no transformer models).
-- The dashboard and streaming app run on a single machine (`local[*]`), the
+- The web app and streaming app run on a single machine (`local[*]`), the
   default Spark deployment. The architecture (Kafka + Structured Streaming +
   MLlib) transfers unchanged to a small cluster.
-- No authentication/authorization anywhere by design (academic MVP, local only).
+- Authentication is JWT-based with two roles (admin / company). Demo credentials are
+  hard-coded in `backend/auth.py` for the academic MVP, so it is still local only
+  and must not be exposed publicly as-is.
 
 ## Future Scope
 

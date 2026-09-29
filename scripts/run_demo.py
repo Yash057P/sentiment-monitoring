@@ -13,8 +13,10 @@
            data/split/simulation.csv  - PART 4: live simulation feed (ONLY the
                                         demo streams tweets from this part)
     4. Train the model on PART 1 and evaluate on PARTS 2 & 3.
-    5. Docker Kafka -> Spark streaming -> producer streaming PART 4 as if it
-       were live -> Streamlit dashboard (browser opens automatically).
+    5. Build the React web app (npm), then run the full live stack:
+       Docker Kafka -> Spark streaming -> producer streaming PART 4 as if it
+       were live -> Flask API (backend/app.py) serving the multi-company web
+       UI (browser opens automatically). Log in as admin/admin or any company.
 
 Press Ctrl+C to stop everything and bring Docker down cleanly.
 
@@ -31,8 +33,8 @@ Options:
     --messages-per-second 10        publish rate (default 10)
     --limit 50000                   train on first N PART-1 rows (faster startup)
     --csv <path>                    use a single CSV directly (no 4-way split)
-    --port 8501                     Streamlit port
-    --no-dashboard                  skip opening the dashboard
+    --port 8000                     Flask API / web UI port
+    --no-dashboard                  skip opening the browser
     --keep-output                   don't wipe output/checkpoints and Kafka data
 """
 
@@ -41,7 +43,9 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib.util
+import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -55,6 +59,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = BASE_DIR / "src"
 SCRIPTS_DIR = BASE_DIR / "scripts"
 LOG_DIR = BASE_DIR / "logs"
+FRONTEND_DIR = BASE_DIR / "frontend"
 DEMO_DATASET = BASE_DIR / "data" / "demo_sample.csv"
 SPLIT_DIR = BASE_DIR / "data" / "split"
 SPLIT_PARTS = ("train", "test", "validation", "simulation")
@@ -123,8 +128,8 @@ def log(message: str) -> None:
     print(f"[demo] {message}", flush=True)
 
 
-def run(args_list: list[str], **kwargs) -> subprocess.CompletedProcess:
-    return subprocess.run(args_list, cwd=str(BASE_DIR), **kwargs)
+def run(args_list: list[str], cwd: Path | None = None, **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(args_list, cwd=str(cwd or BASE_DIR), **kwargs)
 
 
 def ensure_venv() -> Path:
@@ -154,7 +159,7 @@ def ensure_venv() -> Path:
     raise SystemExit(code)
 
 
-REQUIRED_PACKAGES = ("confluent_kafka", "pyspark", "streamlit", "pandas")
+REQUIRED_PACKAGES = ("confluent_kafka", "pyspark", "flask", "jwt", "pyarrow")
 
 
 def ensure_libraries(venv_py: Path) -> None:
@@ -196,6 +201,24 @@ def download_sentiment140(dest: Path) -> bool:
         return False
 
 
+def ensure_frontend() -> None:
+    """Install frontend packages and build the React UI into frontend/dist."""
+    dist_index = FRONTEND_DIR / "dist" / "index.html"
+    if dist_index.exists():
+        return
+    log("Frontend not built - preparing it (one-time npm install + build)...")
+    if not (FRONTEND_DIR / "node_modules").exists():
+        result = run(["npm", "install", "--no-audit", "--no-fund"], cwd=FRONTEND_DIR)
+        if result.returncode != 0:
+            raise RuntimeError("npm install failed. Run it manually in frontend/.")
+    result = run(["npm", "run", "build"], cwd=FRONTEND_DIR)
+    if result.returncode != 0 or not dist_index.exists():
+        log("Frontend build failed - the API will still run, but the web UI "
+            "should be built manually: cd frontend && npm run build")
+    else:
+        log("React web UI built (frontend/dist).")
+
+
 def write_demo_dataset() -> Path:
     """Generate a small labelled CSV so the live demo runs without downloads."""
     if DEMO_DATASET.exists():
@@ -225,6 +248,7 @@ ensure_libraries(VENV_PY)
 from dataset_split import split_dataset  # noqa: E402
 
 PROCS: list[tuple[str, subprocess.Popen]] = []
+CMDS: dict[str, tuple[list[str], dict[str, str] | None]] = {}
 KAFKA_READY_MARKERS = ("(kafka) started", "Kafka Server started")
 
 logging_configured = False
@@ -270,24 +294,52 @@ def kafka_ready() -> bool:
         return False
 
 
+def kafka_accepting_connections(host: str = "127.0.0.1", port: int = 9092) -> bool:
+    """True when the broker port accepts a real TCP connection.
+
+    The docker logs marker "(kafka) started" can be printed while the listener
+    is still coming up, which makes the producer crash on its very first
+    metadata request. A raw TCP connect is the reliable readiness check.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
 def wait_kafka(timeout_s: int = 300) -> None:
     log("Waiting for the Kafka broker to become ready...")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if kafka_ready():
+        if kafka_ready() and kafka_accepting_connections():
             log("Kafka broker is up (container: sml-kafka).")
             return
         time.sleep(5)
     raise RuntimeError("Kafka did not become ready in time. See: docker logs sml-kafka")
 
 
-def start_process(name: str, cmd: list[str]) -> None:
+def start_process(name: str, cmd: list[str], env: dict[str, str] | None = None) -> None:
     ensure_logging()
     out = open(LOG_DIR / f"{name}.log", "a", encoding="utf-8")
-    proc = subprocess.Popen(cmd, cwd=str(BASE_DIR), stdout=out, stderr=subprocess.STDOUT)
+    full_env = {**os.environ, **(env or {})}
+    proc = subprocess.Popen(cmd, cwd=str(BASE_DIR), stdout=out, stderr=subprocess.STDOUT,
+                            env=full_env)
     PROCS.append((name, proc))
+    CMDS[name] = (cmd, env)
     log(f"Started {name} (pid {proc.pid}) -> logs/{name}.log")
     time.sleep(2)
+
+
+def supervise() -> None:
+    """Restart any pipeline component that died (keeps the demo self-healing)."""
+    for name, (cmd, env) in list(CMDS.items()):
+        entry = next(((n, p) for n, p in PROCS if n == name), None)
+        if entry is not None and entry[1].poll() is not None:
+            log(f"{name} stopped unexpectedly (code {entry[1].returncode}) "
+                f"- restarting it...")
+            PROCS.remove(entry)
+            start_process(name, cmd, env)
 
 
 def wait_streaming_ready(timeout_s: int = 180) -> None:
@@ -312,8 +364,8 @@ def dashboard_ready(url: str, timeout_s: int = 90) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(url + "/_stcore/health", timeout=5) as resp:
-                if resp.read() == b"ok":
+            with urllib.request.urlopen(url + "/api/health", timeout=5) as resp:
+                if resp.status == 200 and resp.read():
                     return True
         except Exception:
             pass
@@ -453,7 +505,8 @@ def main() -> int:
                         help="train on first N PART-1 rows (faster)")
     parser.add_argument("--csv", default=None,
                         help="use a single CSV directly (no 4-way split)")
-    parser.add_argument("--port", type=int, default=8501)
+    parser.add_argument("--port", type=int, default=8000,
+                        help="Flask API / web UI port")
     parser.add_argument("--no-dashboard", action="store_true")
     parser.add_argument("--keep-output", action="store_true",
                         help="do not wipe previous output/checkpoints/Kafka data")
@@ -505,16 +558,14 @@ def main() -> int:
         )
 
     if not args.no_dashboard:
+        ensure_frontend()
         url = f"http://localhost:{args.port}"
-        start_process("dashboard", [
-            str(VENV_PY), "-m", "streamlit", "run", "dashboard/app.py",
-            "--server.headless", "true",
-            "--server.port", str(args.port),
-        ])
-        log("Waiting for the dashboard to come up...")
+        start_process("dashboard", [str(VENV_PY), "backend/app.py"],
+                      env={"BACKEND_PORT": str(args.port)})
+        log("Waiting for the web app to come up...")
         if dashboard_ready(url):
             webbrowser.open(url)
-            log(f"Dashboard open at {url}")
+            log(f"BrandScope web app open at {url}")
 
     log("=" * 62)
     log("  LIVE - all components running:")
@@ -522,13 +573,19 @@ def main() -> int:
     log(f"    Spark streaming ...... predictions + 1-min trends")
     log(f"    Producer ............. {args.messages_per_second} msg/s (looping)")
     log(f"    Live tweet source .... {plan['note']}")
-    log(f"    Dashboard ............ http://localhost:{args.port}")
+    log(f"    Web app .............. http://localhost:{args.port}")
+    log(f"    Login ................ admin/admin (or any company handle)")
     log("")
     log("  Press Ctrl+C in this window to stop everything.")
     log("=" * 62)
     try:
+        last_check = 0.0
         while True:
-            time.sleep(1)
+            time.sleep(2)
+            now = time.monotonic()
+            if now - last_check >= 20:
+                last_check = now
+                supervise()
     except KeyboardInterrupt:
         log("Stopping demo...")
         cleanup(kill_docker=not args.keep_output)

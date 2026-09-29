@@ -35,6 +35,7 @@ from pathlib import Path
 from confluent_kafka import Producer
 from confluent_kafka.admin import AdminClient
 
+import companies
 import config
 import dataset_utils
 
@@ -44,15 +45,20 @@ LOG_EVERY = 100
 
 
 def build_message(
-    target: str, tweet_id: str, date: str, user: str, text: str
+    target: str, tweet_id: str, date: str, user: str, text: str, source: str = "dataset"
 ) -> dict | None:
     """Build a Kafka JSON payload from a Sentiment140 CSV row.
 
-    Returns None when the label cannot be converted so the row is skipped.
+    Adds a company attribution (`company` handle, `company_name`, `sector`)
+    computed from the tweet text. Returns None when the label cannot be
+    converted so the row is skipped.
     """
     label = dataset_utils.target_to_label(target)
     if label is None:
         return None
+
+    company_handle = companies.attribution(text)
+    company = companies.COMPANIES_BY_HANDLE.get(company_handle) if company_handle else None
 
     now = datetime.now(timezone.utc)
     return {
@@ -63,6 +69,10 @@ def build_message(
         "actual_sentiment": label,
         "ingestion_timestamp": now.isoformat(),
         "ingestion_ts_ms": int(now.timestamp() * 1000),
+        "company": company.handle if company else None,
+        "company_name": company.name if company else None,
+        "sector": company.sector if company else None,
+        "source": source,
     }
 
 
@@ -72,12 +82,22 @@ def message_to_bytes(message: dict) -> bytes:
 
 
 def check_kafka_available(bootstrap_servers: str) -> None:
-    """Fail fast with a helpful message when Kafka is not reachable."""
+    """Fail fast with a helpful message when Kafka is not reachable.
+
+    Retries briefly: right after `docker compose up` the broker can take a few
+    seconds to start accepting metadata requests even though the port is open.
+    """
     admin = AdminClient({"bootstrap.servers": bootstrap_servers})
+    for attempt in range(4):
+        try:
+            admin.list_topics(timeout=5)
+            return
+        except Exception:  # noqa: BLE001 - report any connect failure clearly
+            if attempt < 3:
+                time.sleep(4)
     try:
-        metadata = admin.list_topics(timeout=5)
-        _ = metadata
-    except Exception as exc:  # noqa: BLE001 - report any connect failure clearly
+        admin.list_topics(timeout=5)
+    except Exception as exc:
         logger.error(
             "Kafka is not reachable at '%s'. "
             "Start it with `docker compose up -d` and wait until the container "
@@ -95,6 +115,7 @@ def run(
     messages_per_second: int,
     max_messages: int | None,
     repeat: int = 1,
+    enrich_every: int = 3,
 ) -> None:
     check_kafka_available(bootstrap_servers)
     dataset_utils.check_dataset(dataset_path)
@@ -112,13 +133,40 @@ def run(
 
     logger.info(
         "Connected to Kafka at %s, publishing to topic '%s' "
-        "(rate=%d msg/s, max_messages=%s, repeat=%s)",
+        "(rate=%d msg/s, max_messages=%s, repeat=%s, enrich_every=%d)",
         bootstrap_servers,
         topic,
         messages_per_second,
         max_messages if max_messages else "until end of dataset",
         repeat if repeat else "forever",
+        enrich_every,
     )
+
+    enrichment = companies.enrichment_tweets()
+    enrich_index = 0
+
+    def next_enrichment() -> dict | None:
+        nonlocal enrich_index
+        if not enrichment:
+            return None
+        record = enrichment[enrich_index % len(enrichment)]
+        enrich_index += 1
+        label = "4" if record["label"] == 4 else "0"
+        message = build_message(
+            label,
+            f"enr-{enrich_index}",
+            datetime.now(timezone.utc).strftime("%a %b %d %H:%M:%S +0000 %Y"),
+            "brandscope",
+            record["text"],
+            source="enrichment",
+        )
+        if message is not None and record["company"]:
+            company = companies.COMPANIES_BY_HANDLE.get(record["company"])
+            if company:
+                message["company"] = company.handle
+                message["company_name"] = company.name
+                message["sector"] = company.sector
+        return message
 
     # Incremental streaming read - never loads the whole dataset into memory.
     start_wall = time.monotonic()
@@ -143,6 +191,14 @@ def run(
                 message = build_message(target, tweet_id, date, user, text)
                 if message is None or not message["text"].strip():
                     continue
+
+                # Every `enrich_every`-th slot re-publishes a clearly branded
+                # tweet instead, so company dashboards stay lively even where
+                # the raw dataset barely mentions a sector.
+                if enrich_every > 0 and published % enrich_every == enrich_every - 1:
+                    branded = next_enrichment()
+                    if branded is not None:
+                        message = branded
 
                 payload = message_to_bytes(message)
                 producer.produce(
@@ -201,6 +257,13 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="How many times to replay the dataset (default: 1, use 0 = loop forever)",
     )
+    parser.add_argument(
+        "--enrich-every",
+        type=int,
+        default=3,
+        help="Inject one clearly branded company tweet every N messages "
+             "(default: 3; 0 disables enrichment)",
+    )
     return parser.parse_args()
 
 
@@ -214,6 +277,7 @@ def main() -> None:
         messages_per_second=args.messages_per_second,
         max_messages=args.max_messages,
         repeat=args.repeat,
+        enrich_every=args.enrich_every,
     )
 
 
